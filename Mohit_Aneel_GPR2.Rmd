@@ -1,0 +1,428 @@
+---
+title: "GPR2"
+output: pdf_document
+date: "2024-04-17"
+---
+
+```{r}
+options(repos = c(CRAN = "https://cran.rstudio.com"))
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+library(readxl)
+library(randomForest)
+library(ggplot2)
+library(lmtest)
+library(rpart)
+library(rpart.plot)
+
+data_ml <- read_excel("C:/Users/HP/Downloads/data_ml.xlsx")
+
+colnames(data_ml)[2] <- "date"
+
+data_new <- subset(data_ml, 
+                   select = -c(R3M_Usd, R6M_Usd, R12M_Usd))
+
+
+data_new <- data_new %>%
+  na.omit() %>%       # delete NAs
+  filter(R1M_Usd < 5) %>%  # delete data where 1M return is >500%
+  mutate(R1M_Usd = log(R1M_Usd + 1))  # log transform
+
+# Filter for common stocks
+common_stocks <- data_ml %>%
+  group_by(stock_id) %>%
+  filter(n() == max(n())) %>% # Efficient stock filtering
+  pull(stock_id)          
+
+data_new <- data_ml %>% 
+  filter(stock_id %in% common_stocks)
+
+# Visualize and summarize
+hist(data_new$R1M_Usd, breaks = 'FD')
+summary(data_new)
+sapply(data_new, sd)  
+ggplot(data_new, aes(x = Mkt_Cap_6M_Usd)) + geom_histogram() 
+
+# Function to generate quintile summaries
+generate_quintile_summary <- function(data, variable_name) {
+  data %>%
+    select(stock_id, date, {{ variable_name }}, R1M_Usd) %>%
+    arrange(date, {{ variable_name }}) %>%
+    group_by(date) %>%
+    mutate(quantilegroup = ntile({{ variable_name }}, 5)) %>%
+    group_by(date, quantilegroup) %>%
+    summarise(quant_return = mean(R1M_Usd))
+}
+
+# List of variables
+variables <- c("Mkt_Cap_6M_Usd", "Pb", "Mom_Sharp_5M_Usd", "Ebitda_Margin", "Capex_Sales")
+
+# Apply the function to each variable
+quintile_summaries <- lapply(variables, function(var) generate_quintile_summary(data_new, !!sym(var)))
+
+quintile_smb <- quintile_summaries[[1]]
+quintile_hml <- quintile_summaries[[2]]
+quintile_wml <- quintile_summaries[[3]]
+quintile_rmw <- quintile_summaries[[4]]
+quintile_cma <- quintile_summaries[[5]]
+
+# Average monthly returns
+month_ret <- data_new %>%
+  select(stock_id, date, R1M_Usd) %>%
+  group_by(date) %>%
+  summarize(R1M_Usd = mean(R1M_Usd))
+
+month_ret
+
+
+# Factor returns
+
+factor_ret <- data.frame(
+  date = unique(quintile_smb$date),
+  smb_return = 
+    quintile_smb[(quintile_smb$quantilegroup == 1),]$quant_return -
+    quintile_smb[(quintile_smb$quantilegroup == 5),]$quant_return,
+  hml_return =
+    quintile_hml[(quintile_hml$quantilegroup == 1),]$quant_return -
+    quintile_hml[(quintile_hml$quantilegroup == 5),]$quant_return,
+  wml_return =
+    quintile_wml[(quintile_wml$quantilegroup == 5),]$quant_return -
+    quintile_wml[(quintile_wml$quantilegroup == 1),]$quant_return,
+  rmw_return =
+    quintile_rmw[(quintile_rmw$quantilegroup == 5),]$quant_return -
+    quintile_rmw[(quintile_rmw$quantilegroup == 1),]$quant_return,
+  cma_return =
+    quintile_cma[(quintile_cma$quantilegroup == 1),]$quant_return -
+    quintile_cma[(quintile_cma$quantilegroup == 5),]$quant_return,
+  return_1M = month_ret$R1M_Usd
+)
+factor_ret
+
+calculate_sharpe_ratio <- function(predicted_returns, risk_free_rate = 0.02) {
+  excess_returns <- predicted_returns - risk_free_rate
+  sharpe_ratio <- mean(excess_returns) / sd(excess_returns)
+  return(sharpe_ratio)
+}
+
+# **Performance Calculation Functions** 
+calculate_rmse <- function(model, data) {
+  predictions <- as.numeric(predict(model, newdata = data)) # Force numeric vector
+  sqrt(mean((data$return_1M - predictions)^2))
+}
+
+calculate_mae <- function(model, data) {
+  predictions <- predict(model, newdata = data)
+  mean(abs(data$return_1M - predictions))
+}
+
+
+set.seed(20904651)  # Set random seed for reproducibility
+
+# Split into 80% training, 20% testing 
+split_index <- sample(1:nrow(data_new), size = nrow(data_new)*0.8)  
+
+train_data <- data_new[split_index, ]
+test_data <- data_new[-split_index, ]
+
+# Merge train_data with factor returns
+train_data <- merge(train_data, factor_ret, by = "date") # Adjust if your merge criteria is different
+
+# Merge factor returns with test data (assuming 'factor_ret' exists)
+test_data <- merge(test_data, factor_ret, by = "date") # Adjust if merge criteria differ
+
+mlr_model <- lm(return_1M ~ smb_return + hml_return + wml_return + rmw_return + cma_return,
+                data = train_data) 
+summary(mlr_model)
+
+install.packages("car")
+library(car) 
+vif(mlr_model)
+
+# Residual Plots
+plot(mlr_model, which = 1:2)  # Q-Q Plot, Residuals vs Fitted 
+
+# Breusch-Pagan Test
+bptest(mlr_model) 
+
+install.packages("sandwich")
+library(sandwich)
+robust_se <- vcovHC(mlr_model)
+robust_se
+
+# Extract robust standard errors
+robust_std_errors <- sqrt(diag(robust_se))
+
+# Coefficients and p-values for all factors 
+coefficients <- coef(summary(mlr_model))[, "Estimate"]
+t_stats <- coefficients / robust_std_errors
+p_values <- 2 * pt(abs(t_stats), df = nrow(train_data) - 6) 
+
+# Print the results in a readable format 
+results <- data.frame(Factor = names(coefficients), 
+                      Coefficient = coefficients, 
+                      Robust_SE = robust_std_errors,
+                      t_stat = t_stats,
+                      p_value = p_values)
+print(results)
+
+install.packages("caret")
+library(caret) # Package for cross-validation
+
+# Set number of folds for cross-validation
+num_folds <- 10
+
+# Create cross-validation index
+folds <- createFolds(train_data$return_1M, k = num_folds, returnTrain = TRUE)
+
+# Function to calculate RMSE during cross-validation
+calculate_cv_rmse <- function(data, indices) {
+  data_subset <- data[indices, ] # Data for this fold
+  model <- lm(return_1M ~ smb_return + hml_return + wml_return + rmw_return + cma_return, data = data_subset) 
+  
+  predictions <- predict(model, newdata = data[-indices, ])
+  sqrt(mean((data[-indices, "return_1M"] - predictions)^2))
+}
+
+# Perform cross-validation
+cv_results <- sapply(folds, calculate_cv_rmse, data = train_data) 
+mean_cv_rmse <- mean(cv_results)
+
+print(mean_cv_rmse)
+
+test_rmse <- calculate_rmse(mlr_model, test_data)
+print(test_rmse)
+
+
+install.packages(c("glmnet","randomForest"))
+library(glmnet)
+x <- model.matrix(return_1M ~ . - 1, data = train_data)  # Design matrix
+y <- train_data$return_1M
+elastic_model <- cv.glmnet(x, y, alpha = 0.5)  
+coef(elastic_model, s = elastic_model$lambda.min)  # Important coefficients
+
+
+rf_model <- randomForest(return_1M ~  smb_return + hml_return + wml_return + rmw_return
+                    + cma_return , data = train_data)
+
+tree_model <- rpart(return_1M ~ smb_return + hml_return + wml_return + rmw_return
+                    + cma_return, data = train_data)
+rpart.plot(tree_model)  # Visualize
+
+
+#
+install.packages("vip")
+library(vip)
+predict_func <- function(object, newdata) {
+  # This function takes the fitted model object (object) and new data (newdata)
+  # and returns the predictions from the model on the new data
+  return(predict(object, newdata = newdata))
+}
+importance <- vip(tree_model, method = "permute", train = train_data, target = "return_1M", 
+                  metric = "RMSE", pred_wrapper = predict_func)
+plot(importance)
+
+importance1 <- vip(rf_model, method = "permute", train = train_data, target = "return_1M", 
+                  metric = "RMSE", pred_wrapper = predict_func)
+plot(importance1)
+
+
+# **Calculate Metrics (MLR)**
+mlr_rmse <- calculate_rmse(mlr_model, test_data)
+mlr_mae <- calculate_mae(mlr_model, test_data)
+mlr_sharpe <- calculate_sharpe_ratio(predict(mlr_model, test_data)) 
+
+# **Calculate Metrics (Decision Tree)**
+tree_rmse <- calculate_rmse(tree_model, test_data)
+tree_mae <- calculate_mae(tree_model, test_data)
+tree_sharpe <- calculate_sharpe_ratio(predict(tree_model, test_data))
+
+rf_rmse <- calculate_rmse(rf_model, test_data)
+rf_mae <- calculate_mae(rf_model, test_data)
+rf_sharpe <- calculate_sharpe_ratio(predict(rf_model, test_data))
+
+# **Create Performance Table**
+performance_table <- data.frame(
+  Model = c("MLR", "Decision Tree", "Random Forest"),
+  RMSE = c(mlr_rmse, tree_rmse, rf_rmse),
+  MAE = c(mlr_mae, tree_mae, rf_mae),
+  Sharpe = c(mlr_sharpe, tree_sharpe, rf_sharpe) 
+) 
+print(performance_table)
+
+
+# Hybrid Model Decision Tree and Random Forest
+top_features <- c("rmw_return","wml_return","hml_return")
+print(top_features)
+
+top_features_rf <- c("rmw_return","wml_return","smb_return")
+
+train_data_hybrid <- train_data
+
+# Fit the refined MLR model using train_data
+mlr_refined_model <- lm(return_1M ~ rmw_return + wml_return + hml_return, data = train_data_hybrid)
+
+mlr_refined_model_rf <- lm(return_1M ~ rmw_return + wml_return + smb_return, data = train_data_hybrid)
+
+
+summary(mlr_refined_model)
+summary(mlr_refined_model_rf)
+# Calculate residuals from the refined MLR model
+mlr_residuals <- residuals(mlr_refined_model) 
+mlr_residuals_rf <- residuals(mlr_refined_model_rf)
+train_data_hybrid$mlr_residuals <- mlr_residuals 
+train_data_hybrid$mlr_residuals_rf <- mlr_residuals_rf
+
+
+# Residual Plots
+plot(mlr_refined_model, which = 1:2)  # Q-Q Plot, Residuals vs Fitted 
+plot(mlr_refined_model_rf, which = 1:2)  # Q-Q Plot, Residuals vs Fitted 
+
+#install.packages("sandwich")
+#library(sandwich)
+robust_se <- vcovHC(mlr_refined_model)
+robust_se
+robust_se_rf <- vcovHC(mlr_refined_model_rf)
+robust_se_rf
+
+# Extract robust standard errors
+robust_std_errors <- sqrt(diag(robust_se))
+robust_std_errors_rf <- sqrt(diag(robust_se_rf))
+
+coefficients <- coef(summary(mlr_refined_model))[, "Estimate"] 
+t_stats <- coefficients / robust_std_errors
+p_values <- 2 * pt(abs(t_stats), df = nrow(train_data_hybrid) - 4)
+
+coefficients_rf <- coef(summary(mlr_refined_model_rf))[, "Estimate"] 
+t_stats_rf <- coefficients_rf / robust_std_errors_rf
+p_values_rf <- 2 * pt(abs(t_stats_rf), df = nrow(train_data_hybrid) - 4)
+
+results <- data.frame(Factor = names(coefficients), 
+                      Coefficient = coefficients, 
+                      Robust_SE = robust_std_errors,
+                      t_stat = t_stats,
+                      p_value = p_values)
+print(results)
+
+
+results_rf <- data.frame(Factor = names(coefficients_rf), 
+                         Coefficient = coefficients_rf, 
+                         Robust_SE = robust_std_errors_rf,
+                         t_stat = t_stats_rf,
+                         p_value = p_values_rf)
+print(results_rf)
+
+#install.packages("caret")
+#library(caret) # Package for cross-validation
+
+# Set number of folds for cross-validation
+num_folds <- 10
+
+# Create cross-validation index
+folds <- createFolds(train_data_hybrid$return_1M, k = num_folds, returnTrain = TRUE)
+
+# Function to calculate RMSE during cross-validation
+calculate_cv_rmse <- function(data, indices) {
+  data_subset <- data[indices, ] # Data for this fold
+  model <- lm(return_1M ~ ., data = data_subset) 
+  
+  predictions <- predict(model, newdata = data[-indices, ])
+  sqrt(mean((data[-indices, "return_1M"] - predictions)^2))
+}
+
+# Perform cross-validation
+cv_results <- sapply(folds, calculate_cv_rmse, data = train_data_hybrid) 
+mean_cv_rmse <- mean(cv_results)
+
+print(mean_cv_rmse)
+
+
+# Fit the residuals tree using the same factors as before
+residuals_tree <- rpart(mlr_residuals ~ rmw_return + wml_return + hml_return, data = train_data_hybrid) 
+
+# Fit the residuals tree using the same factors as before
+residuals_tree_dt <- rpart(mlr_residuals ~ rmw_return + wml_return + smb_return, data = train_data_hybrid) 
+
+# Fit the residuals with random forest
+residuals_rf <- randomForest(mlr_residuals ~  rmw_return + wml_return + smb_return , data = train_data_hybrid) 
+
+# Create 'test_data_hybrid' analogous to 'train_data'  
+test_data_hybrid <- test_data
+
+test_data_hybrid_rf <- test_data
+
+test_data_hybrid_rf_dt <- test_data
+
+# Making predictions on test_data_hybrid_rf
+test_data_hybrid_rf$hybrid_pred <- predict(mlr_refined_model, test_data_hybrid_rf) + predict(residuals_rf, test_data_hybrid_rf)
+
+# Making predictions on test_data_hybrid_rf_dt 
+test_data_hybrid_rf_dt$hybrid_pred <- predict(mlr_refined_model, test_data_hybrid_rf) + predict(residuals_tree_dt, test_data_hybrid_rf)
+
+# Make predictions on test_data_hybrid
+test_data_hybrid$hybrid_pred <- predict(mlr_refined_model, test_data_hybrid) + predict(residuals_tree, test_data_hybrid) 
+
+test_rmse <- calculate_rmse(mlr_refined_model, test_data_hybrid)
+print(test_rmse)
+
+
+test_rmse_rf <- calculate_rmse(mlr_refined_model, test_data_hybrid_rf)
+print(test_rmse_rf)
+
+
+test_rmse_rf <- calculate_rmse(mlr_refined_model, test_data_hybrid_rf_dt)
+print(test_rmse_rf)
+
+
+## Calculate metrics for the hybrid model
+hybrid_rmse <- sqrt(mean((test_data_hybrid$return_1M - test_data_hybrid$hybrid_pred)^2))
+hybrid_mae <- mean(abs(test_data_hybrid$return_1M - test_data_hybrid$hybrid_pred))
+hybrid_sharpe <- calculate_sharpe_ratio(test_data_hybrid$hybrid_pred)
+
+hybrid_rmse_rf <- sqrt(mean((test_data_hybrid_rf$return_1M - test_data_hybrid_rf$hybrid_pred)^2))
+hybrid_mae_rf <- mean(abs(test_data_hybrid_rf$return_1M - test_data_hybrid_rf$hybrid_pred))
+hybrid_sharpe_rf <- calculate_sharpe_ratio(test_data_hybrid_rf$hybrid_pred)
+
+hybrid_rmse_rf_dt <- sqrt(mean((test_data_hybrid_rf_dt$return_1M - test_data_hybrid_rf_dt$hybrid_pred)^2))
+hybrid_mae_rf_dt <- mean(abs(test_data_hybrid_rf_dt$return_1M - test_data_hybrid_rf_dt$hybrid_pred ))
+hybrid_sharpe_rf_dt <- calculate_sharpe_ratio(test_data_hybrid_rf_dt$hybrid_pred)
+
+# Add hybrid results to performance_table
+performance_table <- rbind(performance_table, 
+                           data.frame(Model = "Hybrid Decision Tree",
+                                      RMSE = hybrid_rmse,
+                                      MAE = hybrid_mae,
+                                      Sharpe = hybrid_sharpe))
+performance_table <- rbind(performance_table, 
+                           data.frame(Model = "Hybrid Random Forest",
+                                      RMSE = hybrid_rmse_rf,
+                                      MAE = hybrid_mae_rf,
+                                      Sharpe = hybrid_sharpe_rf))
+
+performance_table <- rbind(performance_table, 
+                           data.frame(Model = "Hybrid DT + RF ",
+                                      RMSE = hybrid_rmse_rf_dt,
+                                      MAE = hybrid_mae_rf_dt,
+                                      Sharpe = hybrid_sharpe_rf_dt))
+print(performance_table)
+ggplot(test_data_hybrid, aes(x = return_1M, y = hybrid_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = "Observed Returns", y = "Hybrid Predictions DT", title = "Hybrid Model Performance DT") +
+  theme_minimal() 
+
+ggplot(test_data_hybrid_rf, aes(x = return_1M, y = hybrid_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = "Observed Returns", y = "Hybrid Predictions RF", title = "Hybrid Model Performance RF") +
+  theme_minimal()
+
+ggplot(test_data_hybrid_rf_dt, aes(x = return_1M, y = hybrid_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = "Observed Returns", y = "Hybrid Predictions DT + RF", title = "Hybrid Model Performance DT + RF") +
+  theme_minimal()
+
+```
